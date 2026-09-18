@@ -1,0 +1,42 @@
+{
+  "name": "tallyhook",
+  "version": "0.1.3",
+  "description": "Reads the session logs Claude Code and Codex CLI already write on your machine and works out what they cost. Zero dependencies.",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "ai",
+    "llm",
+    "cost",
+    "usage",
+    "tokens",
+    "cli"
+  ],
+  "homepage": "https://tallyhook.dev",
+  "bugs": {
+    "url": "https://github.com/happymario123/tallyhook-collector/issues",
+    "email": "support@tallyhook.dev"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/happymario123/tallyhook-collector.git"
+  },
+  "license": "MIT",
+  "author": "Tallyhook",
+  "main": "tallyhook.js",
+  "bin": {
+    "tallyhook": "tallyhook.js"
+  },
+  "files": [
+    "tallyhook.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}
