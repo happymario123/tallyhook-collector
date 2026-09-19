@@ -5,7 +5,7 @@ One dependency-free Node.js file that reads the session logs **Claude Code** and
 ## See what each repo cost you (no account, nothing uploaded)
 
 ```sh
-curl -fsSL https://tallyhook.dev/tallyhook.js | node - report
+npx tallyhook report
 ```
 
 ```
@@ -18,7 +18,7 @@ local:scratch                            4     96.2k       $20.36
 TOTAL                                  222     18.1M    $2,338.79
 ```
 
-`report` runs entirely on your machine. Its only network call is a GET for the public price table (`https://tallyhook.dev/api/prices`). Use `--days 90` for a longer window. Prefer not to pipe into node? Download the file, read it, then run `node tallyhook.js report`.
+`report` runs entirely on your machine. Its only network call is a GET for the public price table (`https://tallyhook.dev/api/prices`). Use `--days 90` for a longer window. Prefer to read it first? It is one file, `tallyhook.js`, in this repo. Download it, read it, then run `node tallyhook.js report`.
 
 ## What it gets right
 
@@ -34,10 +34,10 @@ TOTAL                                  222     18.1M    $2,338.79
 [Tallyhook](https://tallyhook.dev) is the hosted team layer on top of this file: every developer's sessions in one place, repos mapped to clients, a monthly budget per client, an alert when one session gets expensive, and an invoice with your markup. There is a [live demo](https://tallyhook.dev/demo) that needs no signup.
 
 ```sh
-node tallyhook.js install <token>   # registers Claude Code hooks (SessionEnd, and Stop at most every 10 minutes), uploads history
-node tallyhook.js sync [--dry-run]  # upload anything new now; --dry-run prints a summary and never touches the network
-node tallyhook.js status            # what is configured
-node tallyhook.js uninstall         # remove the hooks and ~/.tallyhook
+npx tallyhook install <token>       # registers Claude Code hooks (SessionEnd, and Stop at most every 10 minutes), uploads history
+npx tallyhook sync [--dry-run]      # upload anything new now; --dry-run prints a summary and never touches the network
+npx tallyhook status                # what is configured
+npx tallyhook uninstall             # remove the hooks and ~/.tallyhook
 ```
 
 **Uploaded per session (install/sync only):** token counts by model, start and end time, tool and version, git remote and branch, developer identity from git config, machine hostname, turn and tool-call counts, paths of edited files, and the first 160 characters of the first prompt (turn that off with `"privacy": true` in `~/.tallyhook/config.json`).
