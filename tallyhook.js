@@ -18,7 +18,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { execFileSync } = require("child_process");
 
-const VERSION = "0.1.4";
+const VERSION = "0.2.0";
 const FETCH_TIMEOUT_MS = 8000;
 const HOME = os.homedir();
 const DIR = path.join(HOME, ".tallyhook");
@@ -357,89 +357,131 @@ function priceOf(model, table) {
   }
   return null;
 }
-async function report(days, api, { json = false, groupBy = "repo" } = {}) {
+// Read every local session, price it, and return the numbers. Shared by `report` (which formats
+// them for a person) and `mcp` (which hands them to an agent), so the two can never disagree.
+// Writes nothing to stdout: the MCP transport owns stdout and one stray log line corrupts it.
+// Parsing every local log is the expensive half -- on a heavy machine it is ten seconds of
+// straight-line CPU. `report` does it once and exits, but the MCP server is long-lived and an agent
+// asks several questions in a row, so both halves are memoised per process.
+//
+// This is not just a speed nicety. Parsing is synchronous, so it blocks the event loop: two
+// concurrent calls used to starve each other's price fetch past its 8s timeout and silently return
+// every cost as null. Caching plus in-flight sharing means one parse serves them all.
+const CACHE_TTL_MS = 60000;
+let _sessionsCache = null; // { at, promise }
+let _pricesCache = null;   // { at, api, promise }
+
+function loadSessions() {
+  if (_sessionsCache && Date.now() - _sessionsCache.at < CACHE_TTL_MS) return _sessionsCache.promise;
+  const promise = (async () => {
+    const sessions = new Map();
+    const files = listFiles(CLAUDE_PROJECTS, ".jsonl").map((f) => ({ f, kind: "claude" }))
+      .concat(listFiles(CODEX_SESSIONS, ".jsonl", ...(CAN_ZSTD ? [".jsonl.zst"] : [])).map((f) => ({ f, kind: "codex" })));
+    for (const { f, kind } of files) { try { (kind === "claude" ? parseClaudeFile : parseCodexFile)(f, sessions, new Set()); } catch { /* unreadable file: skip */ } }
+    for (const s of sessions.values()) (s.tool === "claude-code" ? tallyClaudeUsage : tallyCodexUsage)(s);
+    return [...sessions.values()].map((s) => finalize(s, {})).filter((s) => s.started_at && Object.keys(s.models).length);
+  })();
+  _sessionsCache = { at: Date.now(), promise };
+  // A failed parse must not be cached as the answer for the next minute.
+  promise.catch(() => { if (_sessionsCache && _sessionsCache.promise === promise) _sessionsCache = null; });
+  return promise;
+}
+
+function loadPrices(api) {
+  if (_pricesCache && _pricesCache.api === api && Date.now() - _pricesCache.at < CACHE_TTL_MS) return _pricesCache.promise;
+  const promise = (async () => {
+    try {
+      const res = await fetch(api + "/api/prices", { headers: { "User-Agent": "tallyhook-collector/" + VERSION }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (res.ok) return (await res.json()).models;
+    } catch { /* offline: report tokens only */ }
+    return null;
+  })();
+  _pricesCache = { at: Date.now(), api, promise };
+  // Don't cache "offline" for a minute -- the next question deserves a fresh attempt.
+  promise.then((t) => { if (!t && _pricesCache && _pricesCache.promise === promise) _pricesCache = null; });
+  return promise;
+}
+
+async function gather(days, api) {
   days = Math.max(1, Math.min(3650, parseInt(days, 10) || 30));
   api = (api || (readJson(CONFIG, null) || {}).api || "https://tallyhook.dev").replace(/\/$/, "");
-  const sessions = new Map();
-  const files = listFiles(CLAUDE_PROJECTS, ".jsonl").map((f) => ({ f, kind: "claude" }))
-    .concat(listFiles(CODEX_SESSIONS, ".jsonl", ...(CAN_ZSTD ? [".jsonl.zst"] : [])).map((f) => ({ f, kind: "codex" })));
-  for (const { f, kind } of files) { try { (kind === "claude" ? parseClaudeFile : parseCodexFile)(f, sessions, new Set()); } catch { /* unreadable file: skip */ } }
-  for (const s of sessions.values()) (s.tool === "claude-code" ? tallyClaudeUsage : tallyCodexUsage)(s);
+  const all = await loadSessions();
   const since = Date.now() - days * 86400000;
   const prevSince = since - days * 86400000; // the equally long window immediately before, for the trend line
-  const all = [...sessions.values()].map((s) => finalize(s, {})).filter((s) => s.started_at && Object.keys(s.models).length);
-  const rows = all.filter((s) => Date.parse(s.started_at) >= since);
+  const rows = all.filter((s) => Date.parse(s.started_at) >= since).map((s) => ({ ...s }));
   const prevRows = all.filter((s) => { const t = Date.parse(s.started_at); return t >= prevSince && t < since; });
-  if (!rows.length) {
-    if (json) { console.log(JSON.stringify({ days, sessions: 0, total_cost_usd: 0, [groupBy === "model" ? "models" : "repos"]: [] }, null, 2)); return; }
-    console.log(`tallyhook: no Claude Code or Codex sessions found in the last ${days} days on this machine.`); return;
-  }
-  let table = null;
-  try {
-    const res = await fetch(api + "/api/prices", { headers: { "User-Agent": "tallyhook-collector/" + VERSION }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-    if (res.ok) table = (await res.json()).models;
-  } catch { /* offline: report tokens only */ }
-  const by_model = groupBy === "model";
+  const table = await loadPrices(api);
   const unpriced = new Set();
-  const costOf = (s) => {
-    let c = 0;
-    for (const [model, u] of Object.entries(s.models)) {
-      const p = table && priceOf(model, table);
-      if (!p) { unpriced.add(model); continue; }
-      c += (u.input * p.input + u.output * p.output + u.cache_write_5m * p.cache_write + u.cache_write_1h * p.input * 2 + u.cache_read * p.cache_read) / 1e6;
-    }
-    return c;
+  const costOfModel = (model, u) => {
+    const p = table && priceOf(model, table);
+    if (!p) { unpriced.add(model); return 0; }
+    return (u.input * p.input + u.output * p.output + u.cache_write_5m * p.cache_write + u.cache_write_1h * p.input * 2 + u.cache_read * p.cache_read) / 1e6;
   };
-  const by = new Map();
+  const costOf = (s) => Object.entries(s.models).reduce((c, [model, u]) => c + costOfModel(model, u), 0);
   let total = 0;
-  for (const s of rows) {
-    s._cost = costOf(s); total += s._cost;
+  for (const s of rows) { s._cost = costOf(s); total += s._cost; }
+  const prevTotal = prevRows.reduce((n, s) => n + costOf(s), 0);
+  return { days, api, table, priced: !!table, rows, prevRows, total, prevTotal, unpriced, costOfModel };
+}
+
+// Rank by repo or by model. A session that spanned two models has its cost split between them, so
+// the model column still totals to the same number as the repo column.
+function rank(g, by_model) {
+  const by = new Map();
+  for (const s of g.rows) {
     if (by_model) {
-      // A session can span models, so its cost is split across them rather than attributed whole.
       for (const [model, u] of Object.entries(s.models)) {
-        const p = table && priceOf(model, table);
-        const c = p ? (u.input * p.input + u.output * p.output + u.cache_write_5m * p.cache_write + u.cache_write_1h * p.input * 2 + u.cache_read * p.cache_read) / 1e6 : 0;
-        const a = by.get(model) || { repo: model, sessions: 0, out: 0, cost: 0 };
-        a.sessions++; a.cost += c; a.out += u.output;
+        const a = by.get(model) || { key: model, sessions: 0, out: 0, cost: 0 };
+        a.sessions++; a.cost += g.costOfModel(model, u); a.out += u.output;
         by.set(model, a);
       }
     } else {
       const k = s.repo || "(no repo)";
-      const a = by.get(k) || { repo: k, sessions: 0, out: 0, cost: 0 };
+      const a = by.get(k) || { key: k, sessions: 0, out: 0, cost: 0 };
       a.sessions++; a.cost += s._cost; a.out += Object.values(s.models).reduce((n, u) => n + u.output, 0);
       by.set(k, a);
     }
   }
-  const prevTotal = prevRows.reduce((n, s) => n + costOf(s), 0);
-  const usd = (n) => "$" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  const tok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
-  const list = [...by.values()].sort((a, b) => b.cost - a.cost || b.out - a.out);
+  return [...by.values()].sort((a, b) => b.cost - a.cost || b.out - a.out);
+}
 
+function summaryOf(g, by_model) {
+  return {
+    days: g.days,
+    generated_at: new Date().toISOString(),
+    priced: g.priced,
+    sessions: g.rows.length,
+    total_cost_usd: g.priced ? Number(g.total.toFixed(4)) : null,
+    previous_period: { sessions: g.prevRows.length, total_cost_usd: g.priced ? Number(g.prevTotal.toFixed(4)) : null },
+    unpriced_models: [...g.unpriced],
+    [by_model ? "models" : "repos"]: rank(g, by_model).map((r) => ({
+      [by_model ? "model" : "repo"]: r.key,
+      sessions: r.sessions,
+      output_tokens: r.out,
+      cost_usd: g.priced ? Number(r.cost.toFixed(4)) : null,
+    })),
+  };
+}
+
+async function report(days, api, { json = false, groupBy = "repo" } = {}) {
+  const g = await gather(days, api);
+  const by_model = groupBy === "model";
+  if (!g.rows.length) {
+    if (json) { console.log(JSON.stringify({ days: g.days, sessions: 0, total_cost_usd: 0, [by_model ? "models" : "repos"]: [] }, null, 2)); return; }
+    console.log(`tallyhook: no Claude Code or Codex sessions found in the last ${g.days} days on this machine.`); return;
+  }
   // --json exists so this is usable from a script without parsing a table that is formatted for
   // people. Same numbers, no prose, and it stays quiet about anything it could not price.
-  if (json) {
-    console.log(JSON.stringify({
-      days,
-      generated_at: new Date().toISOString(),
-      priced: !!table,
-      sessions: rows.length,
-      total_cost_usd: table ? Number(total.toFixed(4)) : null,
-      previous_period: { sessions: prevRows.length, total_cost_usd: table ? Number(prevTotal.toFixed(4)) : null },
-      unpriced_models: [...unpriced],
-      [by_model ? "models" : "repos"]: list.map((r) => ({
-        [by_model ? "model" : "repo"]: r.repo,
-        sessions: r.sessions,
-        output_tokens: r.out,
-        cost_usd: table ? Number(r.cost.toFixed(4)) : null,
-      })),
-    }, null, 2));
-    return;
-  }
-  const w = Math.min(56, Math.max(10, ...list.map((r) => r.repo.length)));
+  if (json) { console.log(JSON.stringify(summaryOf(g, by_model), null, 2)); return; }
+  const { table, total, prevTotal, rows, prevRows, unpriced, days: d, api: apiUrl } = g;
+  const usd = (n) => "$" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const tok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
+  const list = rank(g, by_model);
+  const w = Math.min(56, Math.max(10, ...list.map((r) => r.key.length)));
   const clip = (t) => (t.length > w ? "…" + t.slice(-(w - 1)) : t.padEnd(w));
-  console.log(`\nAI coding-agent usage on this machine, last ${days} days${table ? " (public API list prices)" : " (price list unreachable, tokens only)"}\n`);
+  console.log(`\nAI coding-agent usage on this machine, last ${d} days${table ? " (public API list prices)" : " (price list unreachable, tokens only)"}\n`);
   console.log(`${(by_model ? "MODEL" : "REPO").padEnd(w)}  ${"SESSIONS".padStart(8)}  ${"OUTPUT".padStart(8)}  ${"LIST COST".padStart(11)}`);
-  for (const r of list.slice(0, 25)) console.log(`${clip(r.repo)}  ${String(r.sessions).padStart(8)}  ${tok(r.out).padStart(8)}  ${(table ? usd(r.cost) : "").padStart(11)}`);
+  for (const r of list.slice(0, 25)) console.log(`${clip(r.key)}  ${String(r.sessions).padStart(8)}  ${tok(r.out).padStart(8)}  ${(table ? usd(r.cost) : "").padStart(11)}`);
   if (list.length > 25) console.log(`… and ${list.length - 25} more ${by_model ? "models" : "repos"}`);
   console.log(`${"TOTAL".padEnd(w)}  ${String(rows.length).padStart(8)}  ${tok(list.reduce((n, r) => n + r.out, 0)).padStart(8)}  ${(table ? usd(total) : "").padStart(11)}`);
   if (table) {
@@ -447,13 +489,147 @@ async function report(days, api, { json = false, groupBy = "repo" } = {}) {
     if (prevRows.length) {
       const pct = prevTotal > 0.005 ? Math.round(((total - prevTotal) / prevTotal) * 100) : null;
       const dir = total >= prevTotal ? "up" : "down";
-      console.log(`\nPrevious ${days} days: ${usd(prevTotal)} across ${prevRows.length} session${prevRows.length === 1 ? "" : "s"}${pct === null ? "" : ` — ${dir} ${Math.abs(pct)}%`}.`);
+      console.log(`\nPrevious ${d} days: ${usd(prevTotal)} across ${prevRows.length} session${prevRows.length === 1 ? "" : "s"}${pct === null ? "" : ` — ${dir} ${Math.abs(pct)}%`}.`);
     }
     console.log(`\nMost expensive session: ${usd(top._cost)} in ${top.repo || "(no repo)"}, started ${top.started_at.slice(0, 10)}.`);
     if (unpriced.size) console.log(`No list price for: ${[...unpriced].join(", ")} (counted as $0).`);
     console.log("List price is what this usage would cost on the API. On a subscription it is the value you used, not a bill.");
   }
-  console.log(`\nNothing was uploaded. To see this across a team, per client, with invoices: ${api}\n`);
+  console.log(`\nNothing was uploaded. To see this across a team, per client, with invoices: ${apiUrl}\n`);
+}
+
+// ---------- mcp ----------
+// A Model Context Protocol server over stdio, so an agent can ask what its own work has cost.
+// Deliberately local and account-free: the same files `report` reads, no token, nothing uploaded.
+// JSON-RPC 2.0, newline-delimited, hand-rolled because this package has no dependencies and one
+// small protocol is not worth changing that.
+//
+// The hard rule here is that stdout belongs to the protocol. Any stray console.log corrupts the
+// stream and the client drops the connection, which is why gather() prints nothing and every
+// diagnostic below goes to stderr.
+const MCP_TOOLS = [
+  {
+    name: "usage_by_repo",
+    description: "What AI coding-agent sessions on this machine cost, grouped by git repository, over the last N days. Reads local Claude Code and Codex logs. Nothing is uploaded.",
+    inputSchema: { type: "object", properties: { days: { type: "integer", description: "Window in days (default 30, max 3650).", minimum: 1, maximum: 3650 } } },
+  },
+  {
+    name: "usage_by_model",
+    description: "The same spend grouped by model instead of repository. A session spanning two models has its cost split between them, so the totals agree with usage_by_repo.",
+    inputSchema: { type: "object", properties: { days: { type: "integer", description: "Window in days (default 30, max 3650).", minimum: 1, maximum: 3650 } } },
+  },
+  {
+    name: "expensive_sessions",
+    description: "The individual sessions that cost the most, newest window first. Use this to find a runaway agent loop rather than a general trend.",
+    inputSchema: { type: "object", properties: { days: { type: "integer", description: "Window in days (default 30, max 3650).", minimum: 1, maximum: 3650 }, limit: { type: "integer", description: "How many sessions to return (default 10, max 100).", minimum: 1, maximum: 100 } } },
+  },
+  {
+    name: "usage_summary",
+    description: "Total spend and session count for the window, compared against the equally long window immediately before it. Answers 'am I spending more than last month'.",
+    inputSchema: { type: "object", properties: { days: { type: "integer", description: "Window in days (default 30, max 3650).", minimum: 1, maximum: 3650 } } },
+  },
+];
+
+async function mcpCall(name, args) {
+  const days = args && args.days;
+  if (name === "usage_by_repo") return summaryOf(await gather(days), false);
+  if (name === "usage_by_model") return summaryOf(await gather(days), true);
+  if (name === "usage_summary") {
+    const g = await gather(days);
+    const pct = g.priced && g.prevTotal > 0.005 ? Math.round(((g.total - g.prevTotal) / g.prevTotal) * 100) : null;
+    return {
+      days: g.days, generated_at: new Date().toISOString(), priced: g.priced,
+      sessions: g.rows.length,
+      total_cost_usd: g.priced ? Number(g.total.toFixed(4)) : null,
+      previous_period: { sessions: g.prevRows.length, total_cost_usd: g.priced ? Number(g.prevTotal.toFixed(4)) : null },
+      change_pct: pct,
+      repos: rank(g, false).length,
+      unpriced_models: [...g.unpriced],
+      note: "List price is what this usage would cost on the API. On a subscription it is the value of what you used, not a bill.",
+    };
+  }
+  if (name === "expensive_sessions") {
+    const g = await gather(days);
+    const limit = Math.max(1, Math.min(100, parseInt(args && args.limit, 10) || 10));
+    // Honour the same privacy switch the uploader does: if the user turned prompt capture off,
+    // an agent reading this server does not get the prompt either.
+    const privacy = !!(readJson(CONFIG, null) || {}).privacy;
+    return {
+      days: g.days, generated_at: new Date().toISOString(), priced: g.priced,
+      sessions: g.rows.slice().sort((a, b) => b._cost - a._cost).slice(0, limit).map((s) => ({
+        repo: s.repo || null, branch: s.branch, tool: s.tool,
+        started_at: s.started_at, ended_at: s.ended_at, turns: s.turns,
+        files_touched: s.files_count,
+        cost_usd: g.priced ? Number(s._cost.toFixed(4)) : null,
+        models: Object.keys(s.models),
+        first_prompt: privacy ? null : s.first_prompt,
+      })),
+    };
+  }
+  throw new Error("unknown tool: " + name);
+}
+
+function mcp() {
+  const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
+  const reply = (id, result) => send({ jsonrpc: "2.0", id, result });
+  const fail = (id, code, message) => send({ jsonrpc: "2.0", id, error: { code, message } });
+  let buf = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { fail(null, -32700, "parse error"); continue; }
+      handle(msg);
+    }
+  });
+  // Requests are async (reading logs, fetching the price table), so exiting the moment stdin closes
+  // would abandon whatever is still in flight. Found by testing with piped input, where stdin ends
+  // immediately: one reply went missing entirely and another came back unpriced because its price
+  // fetch never finished. Exit only once nothing is outstanding.
+  let pending = 0, ended = false;
+  const done = () => { if (--pending === 0 && ended) process.exit(0); };
+  process.stdin.on("end", () => { ended = true; if (pending === 0) process.exit(0); });
+
+  async function handle(msg) {
+    const { id, method, params } = msg || {};
+    // A notification has no id and must never be answered, including the unknown ones.
+    if (id === undefined || id === null) return;
+    pending++;
+    try {
+      if (method === "initialize") {
+        const asked = params && typeof params.protocolVersion === "string" ? params.protocolVersion : null;
+        return reply(id, {
+          protocolVersion: asked || "2025-06-18",
+          capabilities: { tools: {} },
+          serverInfo: { name: "tallyhook", version: VERSION },
+          instructions: "Reports what Claude Code and Codex sessions on this machine have cost, grouped by git repository, by model, or session by session. Everything is computed locally from logs the tools already wrote; the only network call is fetching the public price table. Costs are list-price equivalents, so on a subscription they are the value of what you used rather than a bill.",
+        });
+      }
+      if (method === "ping") return reply(id, {});
+      if (method === "tools/list") return reply(id, { tools: MCP_TOOLS });
+      if (method === "tools/call") {
+        const name = params && params.name;
+        try {
+          const out = await mcpCall(name, (params && params.arguments) || {});
+          // Tool failures are results with isError, not JSON-RPC errors, so the model can read and
+          // recover from them rather than the client treating it as a transport fault.
+          return reply(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) }], isError: false });
+        } catch (e) {
+          return reply(id, { content: [{ type: "text", text: "tallyhook: " + (e && e.message ? e.message : String(e)) }], isError: true });
+        }
+      }
+      return fail(id, -32601, "method not found: " + method);
+    } catch (e) {
+      fail(id, -32603, e && e.message ? e.message : String(e));
+    } finally {
+      done();
+    }
+  }
 }
 
 // ---------- install / uninstall ----------
@@ -502,9 +678,10 @@ function status() {
     if (cmd === "install") await install(rest.find((a) => !a.startsWith("--")), val("--api"));
     else if (cmd === "sync") await sync({ quiet: flag("--quiet"), full: flag("--full"), dryRun: flag("--dry-run"), stopHook: flag("--stop-hook"), hook: flag("--hook") || flag("--stop-hook") });
     else if (cmd === "report") await report(val("--days"), val("--api"), { json: flag("--json"), groupBy: val("--by") === "model" ? "model" : "repo" });
+    else if (cmd === "mcp") mcp();
     else if (cmd === "status") status();
     else if (cmd === "uninstall") uninstall();
-    else console.log("tallyhook collector v" + VERSION + "\n  install <token> [--api URL]\n  sync [--quiet] [--full] [--dry-run]\n  status\n  uninstall\n  report [--days 30] [--by model] [--json]   (local only, nothing uploaded)");
+    else console.log("tallyhook collector v" + VERSION + "\n  install <token> [--api URL]\n  sync [--quiet] [--full] [--dry-run]\n  status\n  uninstall\n  report [--days 30] [--by model] [--json]   (local only, nothing uploaded)\n  mcp                                       (MCP server over stdio, local only, no account)");
   } catch (e) {
     console.error("tallyhook: " + (e && e.message ? e.message : e));
     // A sync running from a Claude Code hook must never block a turn, even for an error this
