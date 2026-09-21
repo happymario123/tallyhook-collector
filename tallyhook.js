@@ -9,7 +9,7 @@
  *   node tallyhook.js install <token> [--api https://tallyhook.dev]
  *   node tallyhook.js sync [--quiet] [--full] [--dry-run]
  *   node tallyhook.js status | uninstall
- *   node tallyhook.js report [--days 30]   local only: cost per repo, no account, nothing uploaded
+ *   node tallyhook.js report [--days 30] [--by model] [--json]   local only, nothing uploaded
  */
 "use strict";
 const fs = require("fs");
@@ -18,7 +18,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { execFileSync } = require("child_process");
 
-const VERSION = "0.1.3";
+const VERSION = "0.1.4";
 const FETCH_TIMEOUT_MS = 8000;
 const HOME = os.homedir();
 const DIR = path.join(HOME, ".tallyhook");
@@ -357,7 +357,7 @@ function priceOf(model, table) {
   }
   return null;
 }
-async function report(days, api) {
+async function report(days, api, { json = false, groupBy = "repo" } = {}) {
   days = Math.max(1, Math.min(3650, parseInt(days, 10) || 30));
   api = (api || (readJson(CONFIG, null) || {}).api || "https://tallyhook.dev").replace(/\/$/, "");
   const sessions = new Map();
@@ -366,13 +366,20 @@ async function report(days, api) {
   for (const { f, kind } of files) { try { (kind === "claude" ? parseClaudeFile : parseCodexFile)(f, sessions, new Set()); } catch { /* unreadable file: skip */ } }
   for (const s of sessions.values()) (s.tool === "claude-code" ? tallyClaudeUsage : tallyCodexUsage)(s);
   const since = Date.now() - days * 86400000;
-  const rows = [...sessions.values()].map((s) => finalize(s, {})).filter((s) => s.started_at && Object.keys(s.models).length && Date.parse(s.started_at) >= since);
-  if (!rows.length) { console.log(`tallyhook: no Claude Code or Codex sessions found in the last ${days} days on this machine.`); return; }
+  const prevSince = since - days * 86400000; // the equally long window immediately before, for the trend line
+  const all = [...sessions.values()].map((s) => finalize(s, {})).filter((s) => s.started_at && Object.keys(s.models).length);
+  const rows = all.filter((s) => Date.parse(s.started_at) >= since);
+  const prevRows = all.filter((s) => { const t = Date.parse(s.started_at); return t >= prevSince && t < since; });
+  if (!rows.length) {
+    if (json) { console.log(JSON.stringify({ days, sessions: 0, total_cost_usd: 0, [groupBy === "model" ? "models" : "repos"]: [] }, null, 2)); return; }
+    console.log(`tallyhook: no Claude Code or Codex sessions found in the last ${days} days on this machine.`); return;
+  }
   let table = null;
   try {
     const res = await fetch(api + "/api/prices", { headers: { "User-Agent": "tallyhook-collector/" + VERSION }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (res.ok) table = (await res.json()).models;
   } catch { /* offline: report tokens only */ }
+  const by_model = groupBy === "model";
   const unpriced = new Set();
   const costOf = (s) => {
     let c = 0;
@@ -387,23 +394,61 @@ async function report(days, api) {
   let total = 0;
   for (const s of rows) {
     s._cost = costOf(s); total += s._cost;
-    const k = s.repo || "(no repo)";
-    const a = by.get(k) || { repo: k, sessions: 0, out: 0, cost: 0 };
-    a.sessions++; a.cost += s._cost; a.out += Object.values(s.models).reduce((n, u) => n + u.output, 0);
-    by.set(k, a);
+    if (by_model) {
+      // A session can span models, so its cost is split across them rather than attributed whole.
+      for (const [model, u] of Object.entries(s.models)) {
+        const p = table && priceOf(model, table);
+        const c = p ? (u.input * p.input + u.output * p.output + u.cache_write_5m * p.cache_write + u.cache_write_1h * p.input * 2 + u.cache_read * p.cache_read) / 1e6 : 0;
+        const a = by.get(model) || { repo: model, sessions: 0, out: 0, cost: 0 };
+        a.sessions++; a.cost += c; a.out += u.output;
+        by.set(model, a);
+      }
+    } else {
+      const k = s.repo || "(no repo)";
+      const a = by.get(k) || { repo: k, sessions: 0, out: 0, cost: 0 };
+      a.sessions++; a.cost += s._cost; a.out += Object.values(s.models).reduce((n, u) => n + u.output, 0);
+      by.set(k, a);
+    }
   }
+  const prevTotal = prevRows.reduce((n, s) => n + costOf(s), 0);
   const usd = (n) => "$" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   const tok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
   const list = [...by.values()].sort((a, b) => b.cost - a.cost || b.out - a.out);
+
+  // --json exists so this is usable from a script without parsing a table that is formatted for
+  // people. Same numbers, no prose, and it stays quiet about anything it could not price.
+  if (json) {
+    console.log(JSON.stringify({
+      days,
+      generated_at: new Date().toISOString(),
+      priced: !!table,
+      sessions: rows.length,
+      total_cost_usd: table ? Number(total.toFixed(4)) : null,
+      previous_period: { sessions: prevRows.length, total_cost_usd: table ? Number(prevTotal.toFixed(4)) : null },
+      unpriced_models: [...unpriced],
+      [by_model ? "models" : "repos"]: list.map((r) => ({
+        [by_model ? "model" : "repo"]: r.repo,
+        sessions: r.sessions,
+        output_tokens: r.out,
+        cost_usd: table ? Number(r.cost.toFixed(4)) : null,
+      })),
+    }, null, 2));
+    return;
+  }
   const w = Math.min(56, Math.max(10, ...list.map((r) => r.repo.length)));
   const clip = (t) => (t.length > w ? "…" + t.slice(-(w - 1)) : t.padEnd(w));
   console.log(`\nAI coding-agent usage on this machine, last ${days} days${table ? " (public API list prices)" : " (price list unreachable, tokens only)"}\n`);
-  console.log(`${"REPO".padEnd(w)}  ${"SESSIONS".padStart(8)}  ${"OUTPUT".padStart(8)}  ${"LIST COST".padStart(11)}`);
+  console.log(`${(by_model ? "MODEL" : "REPO").padEnd(w)}  ${"SESSIONS".padStart(8)}  ${"OUTPUT".padStart(8)}  ${"LIST COST".padStart(11)}`);
   for (const r of list.slice(0, 25)) console.log(`${clip(r.repo)}  ${String(r.sessions).padStart(8)}  ${tok(r.out).padStart(8)}  ${(table ? usd(r.cost) : "").padStart(11)}`);
-  if (list.length > 25) console.log(`… and ${list.length - 25} more repos`);
+  if (list.length > 25) console.log(`… and ${list.length - 25} more ${by_model ? "models" : "repos"}`);
   console.log(`${"TOTAL".padEnd(w)}  ${String(rows.length).padStart(8)}  ${tok(list.reduce((n, r) => n + r.out, 0)).padStart(8)}  ${(table ? usd(total) : "").padStart(11)}`);
   if (table) {
     const top = rows.slice().sort((a, b) => b._cost - a._cost)[0];
+    if (prevRows.length) {
+      const pct = prevTotal > 0.005 ? Math.round(((total - prevTotal) / prevTotal) * 100) : null;
+      const dir = total >= prevTotal ? "up" : "down";
+      console.log(`\nPrevious ${days} days: ${usd(prevTotal)} across ${prevRows.length} session${prevRows.length === 1 ? "" : "s"}${pct === null ? "" : ` — ${dir} ${Math.abs(pct)}%`}.`);
+    }
     console.log(`\nMost expensive session: ${usd(top._cost)} in ${top.repo || "(no repo)"}, started ${top.started_at.slice(0, 10)}.`);
     if (unpriced.size) console.log(`No list price for: ${[...unpriced].join(", ")} (counted as $0).`);
     console.log("List price is what this usage would cost on the API. On a subscription it is the value you used, not a bill.");
@@ -456,10 +501,10 @@ function status() {
   try {
     if (cmd === "install") await install(rest.find((a) => !a.startsWith("--")), val("--api"));
     else if (cmd === "sync") await sync({ quiet: flag("--quiet"), full: flag("--full"), dryRun: flag("--dry-run"), stopHook: flag("--stop-hook"), hook: flag("--hook") || flag("--stop-hook") });
-    else if (cmd === "report") await report(val("--days"), val("--api"));
+    else if (cmd === "report") await report(val("--days"), val("--api"), { json: flag("--json"), groupBy: val("--by") === "model" ? "model" : "repo" });
     else if (cmd === "status") status();
     else if (cmd === "uninstall") uninstall();
-    else console.log("tallyhook collector v" + VERSION + "\n  install <token> [--api URL]\n  sync [--quiet] [--full] [--dry-run]\n  status\n  uninstall\n  report [--days 30]   (local only, nothing uploaded)");
+    else console.log("tallyhook collector v" + VERSION + "\n  install <token> [--api URL]\n  sync [--quiet] [--full] [--dry-run]\n  status\n  uninstall\n  report [--days 30] [--by model] [--json]   (local only, nothing uploaded)");
   } catch (e) {
     console.error("tallyhook: " + (e && e.message ? e.message : e));
     // A sync running from a Claude Code hook must never block a turn, even for an error this

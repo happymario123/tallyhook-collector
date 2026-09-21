@@ -16,9 +16,19 @@ github.com/acme/storefront             118     10.8M    $1,450.59
 github.com/acme/patient-portal         100      7.2M      $867.84
 local:scratch                            4     96.2k       $20.36
 TOTAL                                  222     18.1M    $2,338.79
+
+Previous 30 days: $1,602.11 across 186 sessions — up 46%.
+
+Most expensive session: $84.10 in github.com/acme/storefront, started 2026-09-14.
 ```
 
-`report` runs entirely on your machine. Its only network call is a GET for the public price table (`https://tallyhook.dev/api/prices`). Use `--days 90` for a longer window. Prefer to read it first? It is one file, `tallyhook.js`, in this repo. Download it, read it, then run `node tallyhook.js report`.
+`report` runs entirely on your machine. Its only network call is a GET for the public price table (`https://tallyhook.dev/api/prices`). Prefer to read it first? It is one file, `tallyhook.js`, in this repo. Download it, read it, then run `node tallyhook.js report`.
+
+| flag | what it does |
+| --- | --- |
+| `--days 90` | a longer window. The trend line always compares against the equally long window immediately before it, so `--days 7` compares this week against last week. |
+| `--by model` | group by model instead of by repo. A session that spanned two models has its cost split between them rather than attributed whole. |
+| `--json` | the same numbers with no prose, for a script. Nothing that could not be priced is guessed: if the price table is unreachable, every cost is `null` and `priced` is `false`. |
 
 ## What it gets right
 

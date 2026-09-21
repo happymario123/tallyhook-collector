@@ -1,6 +1,6 @@
 {
   "name": "tallyhook",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Reads the session logs Claude Code and Codex CLI already write on your machine and works out what they cost. Zero dependencies.",
   "keywords": [
     "claude-code",
