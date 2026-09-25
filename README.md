@@ -89,7 +89,7 @@ npx tallyhook uninstall             # remove the hooks and ~/.tallyhook
 The MCP server above stays local and account-free either way; installing a token does not change
 what it reads or send anything extra.
 
-**Uploaded per session (install/sync only):** token counts by model, start and end time, tool and version, git remote and branch, developer identity from git config, machine hostname, turn and tool-call counts, paths of edited files, and the first 160 characters of the first prompt (turn that off with `"privacy": true` in `~/.tallyhook/config.json`).
+**Uploaded per session (install/sync only):** token counts by model, start and end time, tool and version, git remote and branch, which repositories the edited files belong to, developer identity from git config, machine hostname, turn and tool-call counts, paths of edited files, and the first 160 characters of the first prompt (turn that off with `"privacy": true` in `~/.tallyhook/config.json`).
 
 **Never uploaded:** transcripts, code, diffs, tool output, environment variables.
 

@@ -18,7 +18,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { execFileSync } = require("child_process");
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const FETCH_TIMEOUT_MS = 8000;
 const HOME = os.homedir();
 const DIR = path.join(HOME, ".tallyhook");
@@ -75,6 +75,60 @@ function repoForCwd(cwd) {
   remoteCache.set(cwd, repo);
   return repo;
 }
+// The repo a single touched FILE belongs to, as opposed to the directory the agent was launched
+// from. This is the fix for the attribution bug: `repo` has always been the launch directory, so a
+// session started in a folder of projects billed everything to the folder. Measured across 1,406
+// real sessions, that put a third of spend against the wrong project.
+//
+// Deliberately no `git` subprocess. The first version shelled out per directory and tripled a full
+// sync (12.9s -> 39.2s on 1,411 files) -- and a version bump forces exactly that full sync, inside
+// a hook Claude Code kills at 20 seconds. Walking up for a .git and reading its config does the
+// same job from the filesystem. Every directory on the way up is memoised, so a deep tree costs one
+// walk, not one per file.
+//
+// Returns null rather than guessing when nothing can be verified: an invented repo name would end
+// up on an invoice.
+const fileRepoCache = new Map();
+function repoForFile(file) {
+  let dir = path.dirname(file);
+  for (let i = 0; i < 6 && dir && dir !== "/" && !fs.existsSync(dir); i++) dir = path.dirname(dir);
+  if (!dir || dir === "/") return null;
+
+  const walked = [];
+  let d = dir;
+  while (d && d !== "/" && d !== ".") {
+    if (fileRepoCache.has(d)) { const hit = fileRepoCache.get(d); for (const w of walked) fileRepoCache.set(w, hit); return hit; }
+    walked.push(d);
+    let dotgit = null;
+    try { dotgit = fs.statSync(path.join(d, ".git")); } catch { /* keep walking */ }
+    if (dotgit) {
+      const repo = repoAt(d, dotgit);
+      for (const w of walked) fileRepoCache.set(w, repo);
+      return repo;
+    }
+    d = path.dirname(d);
+  }
+  for (const w of walked) fileRepoCache.set(w, null);
+  return null;
+}
+// The remote of a repo root, read straight from .git/config. `.git` is a file rather than a
+// directory inside a worktree or submodule, in which case it names the real git dir.
+function repoAt(top, dotgit) {
+  let gitDir = path.join(top, ".git");
+  try {
+    if (dotgit.isFile()) {
+      const m = /gitdir:\s*(.+)/.exec(fs.readFileSync(gitDir, "utf8"));
+      if (m) gitDir = path.resolve(top, m[1].trim());
+    }
+    const cfg = fs.readFileSync(path.join(gitDir, "config"), "utf8");
+    // the url of [remote "origin"], not whichever remote happens to come first
+    const sec = /\[remote "origin"\]([\s\S]*?)(?=\n\[|$)/.exec(cfg);
+    const url = sec && /^\s*url\s*=\s*(.+)$/m.exec(sec[1]);
+    if (url) { const n = normalizeRemote(url[1].trim()); if (n) return n; }
+  } catch { /* no config, or unreadable */ }
+  return "local:" + path.basename(top);
+}
+
 function normalizeRemote(url) {
   if (!url) return null;
   let u = url.trim();
@@ -245,12 +299,20 @@ function finalize(s, config) {
   const ended = isFinite(s._max) ? new Date(s._max).toISOString() : null;
   const repo = s._repoUrl ? normalizeRemote(s._repoUrl) : repoForCwd(s.cwd);
   const cwd = s.cwd || "";
+  // Where the work actually happened, counted per repo. The server uses this to split a session's
+  // cost across projects instead of putting all of it on the launch directory.
+  const reposTouched = {};
+  for (const f of s._files) {
+    const r = repoForFile(f);
+    if (r) reposTouched[r] = (reposTouched[r] || 0) + 1;
+  }
   const files = [...s._files].map((f) => (cwd && f.startsWith(cwd + "/") ? f.slice(cwd.length + 1) : path.basename(f))).slice(0, 200);
   return {
     tool: s.tool, session_id: s.session_id, started_at: started, ended_at: ended, repo, branch: s.branch,
     cwd_name: cwd ? path.basename(cwd) : null, version: s.version, entrypoint: s.entrypoint, turns: s.turns,
     first_prompt: config.privacy ? null : s.first_prompt, tool_calls: s.tool_calls, files_touched: files, files_count: s._files.size,
     models: s.models, subagent_output_tokens: s.subagent_output_tokens,
+    repos_touched: Object.keys(reposTouched).length ? reposTouched : undefined,
   };
 }
 
