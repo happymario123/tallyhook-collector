@@ -18,7 +18,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { execFileSync } = require("child_process");
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const FETCH_TIMEOUT_MS = 8000;
 const HOME = os.homedir();
 const DIR = path.join(HOME, ".tallyhook");
@@ -194,6 +194,19 @@ function parseClaudeFile(file, sessions, touched) {
     if (o.gitBranch && o.gitBranch !== "HEAD" && !s.branch) s.branch = o.gitBranch;
     if (o.version && !s.version) s.version = o.version;
     if (o.entrypoint && !s.entrypoint) s.entrypoint = o.entrypoint;
+    // The agent's own title for the session. Claude Code writes an `ai-title` record and refreshes it
+    // as the session goes, so the LAST one is the most informed -- no `!s.title` guard here, unlike
+    // cwd/branch/version above, which are set once because they cannot legitimately change.
+    //
+    // This exists because naming a session by its first prompt is wrong precisely when it matters. A
+    // templated or scheduled run always opens with the same boilerplate, so whole groups of sessions
+    // ended up sharing one meaningless name while having done completely different work. Measured
+    // across 581 real local sessions: 67% carry an ai-title. The rest, and every Codex session, fall
+    // back to the first prompt exactly as before.
+    if (o.type === "ai-title" && typeof o.aiTitle === "string") {
+      const t = o.aiTitle.replace(/\s+/g, " ").trim();
+      if (t) s.title = t.slice(0, 200);
+    }
     const m = o.message;
     if (o.type === "user" && m && !o.isSidechain) {
       const t = firstHumanText(m.content);
@@ -291,7 +304,7 @@ function tallyCodexUsage(s) {
 }
 
 function newSession(tool, id) {
-  return { tool, session_id: id, cwd: null, branch: null, version: null, entrypoint: null, turns: 0, first_prompt: null,
+  return { tool, session_id: id, cwd: null, branch: null, version: null, entrypoint: null, turns: 0, first_prompt: null, title: null,
     tool_calls: {}, models: {}, subagent_output_tokens: 0, _files: new Set(), _msgs: new Map(), _toolIds: new Set(), _min: Infinity, _max: -Infinity, _repoUrl: null, _codex: null };
 }
 function finalize(s, config) {
@@ -311,6 +324,9 @@ function finalize(s, config) {
     tool: s.tool, session_id: s.session_id, started_at: started, ended_at: ended, repo, branch: s.branch,
     cwd_name: cwd ? path.basename(cwd) : null, version: s.version, entrypoint: s.entrypoint, turns: s.turns,
     first_prompt: config.privacy ? null : s.first_prompt, tool_calls: s.tool_calls, files_touched: files, files_count: s._files.size,
+    // Privacy mode withholds prompt text; a generated title is a summary of the same conversation, so
+    // it is withheld on exactly the same terms rather than leaking around the setting.
+    title: config.privacy ? null : s.title,
     models: s.models, subagent_output_tokens: s.subagent_output_tokens,
     repos_touched: Object.keys(reposTouched).length ? reposTouched : undefined,
   };
