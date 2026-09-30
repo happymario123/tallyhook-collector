@@ -18,7 +18,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { execFileSync } = require("child_process");
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 const FETCH_TIMEOUT_MS = 8000;
 const HOME = os.homedir();
 const DIR = path.join(HOME, ".tallyhook");
@@ -88,15 +88,25 @@ function repoForCwd(cwd) {
 //
 // Returns null rather than guessing when nothing can be verified: an invented repo name would end
 // up on an invoice.
+// `path.dirname` is the only reliable way to ask "am I at the root", because the answer differs by
+// platform: "/" on POSIX, but "C:\\", "D:\\" or "\\\\server\\share" on Windows. At a root, dirname
+// returns its own argument, so comparing to the previous value terminates everywhere.
+//
+// This was a real hang, not a theoretical one. The loop below used to be `while (d !== "/")`, which on
+// a Windows path bottoms out at "C:\\" and spins forever while `walked` grows without bound. It was
+// not limited to sync: loadSessions -> finalize -> repoForFile, so `report` -- the free, no-account,
+// read-nothing-upload-nothing command -- hung too, with no error to explain it.
+const isRoot = (d) => !d || d === "." || path.dirname(d) === d;
+
 const fileRepoCache = new Map();
 function repoForFile(file) {
   let dir = path.dirname(file);
-  for (let i = 0; i < 6 && dir && dir !== "/" && !fs.existsSync(dir); i++) dir = path.dirname(dir);
-  if (!dir || dir === "/") return null;
+  for (let i = 0; i < 6 && !isRoot(dir) && !fs.existsSync(dir); i++) dir = path.dirname(dir);
+  if (isRoot(dir)) return null;
 
   const walked = [];
   let d = dir;
-  while (d && d !== "/" && d !== ".") {
+  while (!isRoot(d)) {
     if (fileRepoCache.has(d)) { const hit = fileRepoCache.get(d); for (const w of walked) fileRepoCache.set(w, hit); return hit; }
     walked.push(d);
     let dotgit = null;
@@ -319,7 +329,22 @@ function finalize(s, config) {
     const r = repoForFile(f);
     if (r) reposTouched[r] = (reposTouched[r] || 0) + 1;
   }
-  const files = [...s._files].map((f) => (cwd && f.startsWith(cwd + "/") ? f.slice(cwd.length + 1) : path.basename(f))).slice(0, 200);
+  // Relative to the session's cwd where possible, and ALWAYS with forward slashes.
+  //
+  // The old form was `f.startsWith(cwd + "/")`, which on Windows never matched (the paths use "\\"),
+  // so every file collapsed to a bare filename and the directory was lost. That is not cosmetic: the
+  // server names a session after the directories it touched, and splits those names on "/". A
+  // Windows machine would have reported "page.tsx" where a Mac reported "src/app/page.tsx", and the
+  // same work would have been named differently depending on who ran it.
+  const rel = (f) => {
+    if (!cwd) return path.basename(f);
+    const r = path.relative(cwd, f);
+    // `path.relative` escapes the cwd with ".." and stays absolute across Windows drives; in either
+    // case the path is not inside this session's project, so only the filename is meaningful.
+    if (!r || r.startsWith("..") || path.isAbsolute(r)) return path.basename(f);
+    return r.split(path.sep).join("/");
+  };
+  const files = [...s._files].map(rel).slice(0, 200);
   return {
     tool: s.tool, session_id: s.session_id, started_at: started, ended_at: ended, repo, branch: s.branch,
     cwd_name: cwd ? path.basename(cwd) : null, version: s.version, entrypoint: s.entrypoint, turns: s.turns,
