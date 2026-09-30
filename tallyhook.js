@@ -18,7 +18,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { execFileSync } = require("child_process");
 
-const VERSION = "0.4.1";
+const VERSION = "0.4.2";
 const FETCH_TIMEOUT_MS = 8000;
 const HOME = os.homedir();
 const DIR = path.join(HOME, ".tallyhook");
@@ -384,7 +384,12 @@ async function sync(opts) {
   }
   // A Claude Code session spans <sid>.jsonl plus <sid>/subagents/*.jsonl. The server replaces a
   // session's usage on upload, so whenever any file of a session changed, re-parse the whole group.
-  const groupOf = (f) => f.replace(/\/subagents\/[^/]+\.jsonl$/, ".jsonl");
+  // Separator-agnostic: on Windows these paths use "\\", so a POSIX-only regex silently failed to
+  // group a subagent file with its parent. The consequence was not cosmetic -- the server REPLACES
+  // a session's usage on upload, so a sync that saw only the subagent file changed would rebuild
+  // the session from the subagent transcript alone and overwrite the full totals with partial ones.
+  // A silent undercount, which is the worst failure mode this collector has.
+  const groupOf = (f) => f.replace(/[\\/]subagents[\\/][^\\/]+\.jsonl$/, ".jsonl");
   const groups = new Set(changed.filter((c) => c.kind === "claude").map((c) => groupOf(c.f)));
   const toParse = new Map(changed.map((c) => [c.f, c]));
   for (const c of files) if (c.kind === "claude" && groups.has(groupOf(c.f)) && !toParse.has(c.f)) toParse.set(c.f, { ...c, sig: sigs.get(c.f) });
