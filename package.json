@@ -1,7 +1,7 @@
 {
   "name": "tallyhook",
-  "version": "0.4.2",
-  "description": "Reads the session logs Claude Code and Codex CLI already write on your machine and works out what they cost. Per repo, per model, per session. Includes an MCP server. Zero dependencies.",
+  "version": "0.5.0",
+  "description": "What your AI coding agents cost, per repo and per client you bill. Reads the session logs Claude Code and Codex CLI already write on your machine, prices them, and rolls repos up into clients with your markup. Includes an MCP server. No account, zero dependencies.",
   "keywords": [
     "claude-code",
     "codex",
@@ -15,7 +15,15 @@
     "model-context-protocol",
     "ai-cost-tracking",
     "token-usage",
-    "agent"
+    "agent",
+    "invoice",
+    "billing",
+    "client-billing",
+    "markup",
+    "agency",
+    "freelance",
+    "cost-allocation",
+    "chargeback"
   ],
   "homepage": "https://tallyhook.dev",
   "bugs": {

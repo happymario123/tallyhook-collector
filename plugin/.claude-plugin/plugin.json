@@ -1,0 +1,30 @@
+{
+  "name": "tallyhook",
+  "displayName": "Tallyhook",
+  "version": "0.5.0",
+  "description": "What your AI coding agents cost: per repo, per model, and per client you bill. Reads the logs already on your disk. No account, nothing uploaded.",
+  "author": {
+    "name": "Tallyhook",
+    "url": "https://tallyhook.dev"
+  },
+  "homepage": "https://tallyhook.dev",
+  "license": "MIT",
+  "keywords": [
+    "cost",
+    "usage",
+    "tokens",
+    "billing",
+    "invoice",
+    "mcp"
+  ],
+  "mcpServers": {
+    "tallyhook": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "tallyhook",
+        "mcp"
+      ]
+    }
+  }
+}

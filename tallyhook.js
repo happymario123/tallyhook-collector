@@ -18,7 +18,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { execFileSync } = require("child_process");
 
-const VERSION = "0.4.2";
+const VERSION = "0.5.0";
 const FETCH_TIMEOUT_MS = 8000;
 const HOME = os.homedir();
 const DIR = path.join(HOME, ".tallyhook");
@@ -451,6 +451,52 @@ async function sync(opts) {
   log(opts.quiet, `tallyhook: uploaded ${uploaded} session(s) as ${dev.key}`);
 }
 
+const usd = (n) => "$" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+const tok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
+
+// ---------- clients (local, free, no account) ----------
+// A client is a name plus the repos that roll up to it. This file is the local, account-less twin of
+// what the hosted app stores per workspace, and it exists because the whole billing question -- "what
+// do I invoice Acme for this month" -- should be answerable on one machine with nothing uploaded.
+// The hosted side earns its keep on what one machine cannot do: history beyond the logs still on
+// disk, several developers in one total, and a link you can hand a client.
+const CLIENTS = path.join(DIR, "clients.json");
+function readClients() {
+  const c = readJson(CLIENTS, null) || {};
+  return { markupPct: Number(c.markupPct) || 0, clients: Array.isArray(c.clients) ? c.clients : [] };
+}
+function writeClients(c) { fs.mkdirSync(DIR, { recursive: true }); writeJson(CLIENTS, c); }
+
+// Patterns match case-insensitively against the repo string the collector already records
+// ("github.com/acme/web", or a bare directory name when there is no remote). A plain pattern is a
+// substring, so "acme" catches every Acme repo; a `*` turns it into an anchored glob for the cases
+// where a substring would catch too much.
+function matchesPattern(repo, pattern) {
+  const r = String(repo).toLowerCase(), p = String(pattern).toLowerCase().trim();
+  if (!p) return false;
+  if (!p.includes("*")) return r.includes(p);
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("^" + p.split("*").map(esc).join(".*") + "$").test(r);
+}
+// First match wins, so the order in clients.json is the tie-breaker and the answer never depends on
+// iteration order. A repo matching nothing is left out of a client report rather than swept into an
+// "unassigned" bucket: a half-mapped machine should produce a report that is visibly incomplete, not
+// one with a plausible-looking total. `tallyhook clients` is what names the gap.
+function clientFor(repo, clients) {
+  for (const c of clients) if ((c.repos || []).some((pat) => matchesPattern(repo, pat))) return c;
+  return null;
+}
+// A per-client rate overrides the file-wide default; absent both, billable equals cost. A `--markup`
+// typed on the command line beats both, because it is the most specific statement of intent available
+// -- without that, `--markup 50` silently does nothing on a file where every client has its own rate.
+function rateOf(c, cfg) {
+  const fallback = cfg && typeof cfg === "object" ? cfg.markupPct : cfg;
+  const forced = cfg && typeof cfg === "object" && cfg.forceMarkup;
+  const raw = !forced && c && c.ratePct !== undefined && c.ratePct !== null ? c.ratePct : fallback;
+  const pct = Number(raw);
+  return 1 + (Number.isFinite(pct) ? pct : 0) / 100;
+}
+
 // ---------- report (local only) ----------
 // Prints what each repo cost on this machine. Needs no account and uploads nothing: the one network
 // call is a GET for the public price list. Matching mirrors the server's: exact or dated model ids only.
@@ -532,28 +578,41 @@ async function gather(days, api) {
   return { days, api, table, priced: !!table, rows, prevRows, total, prevTotal, unpriced, costOfModel };
 }
 
-// Rank by repo or by model. A session that spanned two models has its cost split between them, so
-// the model column still totals to the same number as the repo column.
-function rank(g, by_model) {
-  const by = new Map();
+// Rank by repo, by model, or by client. A session that spanned two models has its cost split between
+// them, so the model column still totals to the same number as the repo column. The client column is
+// the one exception and does not have to total: it covers only the repos someone has actually mapped.
+// `cfg` is a parameter rather than a read inside, so a one-off `--markup` can reach the rate without
+// writing anything to disk.
+function rank(g, by, cfg) {
+  const acc = new Map();
+  if (by === "client" && !cfg) cfg = readClients();
   for (const s of g.rows) {
-    if (by_model) {
+    if (by === "model") {
       for (const [model, u] of Object.entries(s.models)) {
-        const a = by.get(model) || { key: model, sessions: 0, out: 0, cost: 0 };
+        const a = acc.get(model) || { key: model, sessions: 0, out: 0, cost: 0, rate: 1 };
         a.sessions++; a.cost += g.costOfModel(model, u); a.out += u.output;
-        by.set(model, a);
+        acc.set(model, a);
       }
-    } else {
-      const k = s.repo || "(no repo)";
-      const a = by.get(k) || { key: k, sessions: 0, out: 0, cost: 0 };
-      a.sessions++; a.cost += s._cost; a.out += Object.values(s.models).reduce((n, u) => n + u.output, 0);
-      by.set(k, a);
+      continue;
     }
+    let key, client = null;
+    if (by === "client") {
+      client = clientFor(s.repo || "", cfg.clients);
+      if (!client) continue; // unmapped repo: see clientFor
+      key = client.name;
+    } else {
+      key = s.repo || "(no repo)";
+    }
+    const a = acc.get(key) || { key, sessions: 0, out: 0, cost: 0, rate: client ? rateOf(client, cfg) : 1 };
+    a.sessions++; a.cost += s._cost; a.out += Object.values(s.models).reduce((n, u) => n + u.output, 0);
+    acc.set(key, a);
   }
-  return [...by.values()].sort((a, b) => b.cost - a.cost || b.out - a.out);
+  return [...acc.values()].sort((a, b) => b.cost - a.cost || b.out - a.out);
 }
 
-function summaryOf(g, by_model) {
+function summaryOf(g, by, cfg) {
+  const key = by === "model" ? "model" : by === "client" ? "client" : "repo";
+  const list = rank(g, by, cfg);
   return {
     days: g.days,
     generated_at: new Date().toISOString(),
@@ -562,48 +621,169 @@ function summaryOf(g, by_model) {
     total_cost_usd: g.priced ? Number(g.total.toFixed(4)) : null,
     previous_period: { sessions: g.prevRows.length, total_cost_usd: g.priced ? Number(g.prevTotal.toFixed(4)) : null },
     unpriced_models: [...g.unpriced],
-    [by_model ? "models" : "repos"]: rank(g, by_model).map((r) => ({
-      [by_model ? "model" : "repo"]: r.key,
+    [key + "s"]: list.map((r) => ({
+      [key]: r.key,
       sessions: r.sessions,
       output_tokens: r.out,
       cost_usd: g.priced ? Number(r.cost.toFixed(4)) : null,
+      // Rounded to the cent, because this is the number that goes on an invoice. Summing rounded
+      // rows is deliberate and matches the hosted invoice sheet: a client adding up the lines you
+      // showed them must land on the total you billed.
+      ...(r.rate !== 1 ? { rate_multiplier: Number(r.rate.toFixed(4)), billable_usd: g.priced ? Number((r.cost * r.rate).toFixed(2)) : null } : {}),
     })),
   };
 }
 
-async function report(days, api, { json = false, groupBy = "repo" } = {}) {
+async function report(days, api, { json = false, groupBy = "repo", markupPct } = {}) {
   const g = await gather(days, api);
-  const by_model = groupBy === "model";
+  const by = groupBy === "model" ? "model" : groupBy === "client" ? "client" : "repo";
+  const label = by === "model" ? "MODEL" : by === "client" ? "CLIENT" : "REPO";
+  const cfg = readClients();
+  // A `--markup` on the command line overrides the stored default for this run only. Nothing is
+  // written: trying a number should not quietly change what the next invoice says.
+  if (markupPct !== undefined) { cfg.markupPct = markupPct; cfg.forceMarkup = true; }
+
   if (!g.rows.length) {
-    if (json) { console.log(JSON.stringify({ days: g.days, sessions: 0, total_cost_usd: 0, [by_model ? "models" : "repos"]: [] }, null, 2)); return; }
+    if (json) { console.log(JSON.stringify({ days: g.days, sessions: 0, total_cost_usd: 0, [by + "s"]: [] }, null, 2)); return; }
     console.log(`tallyhook: no Claude Code or Codex sessions found in the last ${g.days} days on this machine.`); return;
   }
   // --json exists so this is usable from a script without parsing a table that is formatted for
   // people. Same numbers, no prose, and it stays quiet about anything it could not price.
-  if (json) { console.log(JSON.stringify(summaryOf(g, by_model), null, 2)); return; }
+  if (json) { console.log(JSON.stringify(summaryOf(g, by, cfg), null, 2)); return; }
+
   const { table, total, prevTotal, rows, prevRows, unpriced, days: d, api: apiUrl } = g;
-  const usd = (n) => "$" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  const tok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
-  const list = rank(g, by_model);
-  const w = Math.min(56, Math.max(10, ...list.map((r) => r.key.length)));
-  const clip = (t) => (t.length > w ? "…" + t.slice(-(w - 1)) : t.padEnd(w));
-  console.log(`\nAI coding-agent usage on this machine, last ${d} days${table ? " (public API list prices)" : " (price list unreachable, tokens only)"}\n`);
-  console.log(`${(by_model ? "MODEL" : "REPO").padEnd(w)}  ${"SESSIONS".padStart(8)}  ${"OUTPUT".padStart(8)}  ${"LIST COST".padStart(11)}`);
-  for (const r of list.slice(0, 25)) console.log(`${clip(r.key)}  ${String(r.sessions).padStart(8)}  ${tok(r.out).padStart(8)}  ${(table ? usd(r.cost) : "").padStart(11)}`);
-  if (list.length > 25) console.log(`… and ${list.length - 25} more ${by_model ? "models" : "repos"}`);
-  console.log(`${"TOTAL".padEnd(w)}  ${String(rows.length).padStart(8)}  ${tok(list.reduce((n, r) => n + r.out, 0)).padStart(8)}  ${(table ? usd(total) : "").padStart(11)}`);
+  const list = rank(g, by, cfg);
+
+  // Asking for clients before defining any is the one empty table worth explaining instead of
+  // printing. The spend is real; the mapping is what is missing, so say exactly that.
+  if (by === "client" && !list.length) {
+    console.log(`\ntallyhook: no clients defined yet, so there is nothing to roll ${rows.length} session${rows.length === 1 ? "" : "s"} into.\n`);
+    console.log(`  tallyhook clients add "Acme Corp" acme-web acme-api --rate 20\n`);
+    console.log(`\`tallyhook clients\` lists the repos on this machine so you can see what to map first.\n`);
+    return;
+  }
+
+  const billable = table && list.some((r) => r.rate !== 1);
+  const w = Math.min(56, Math.max(10, label.length, ...list.map((r) => r.key.length)));
+  const clip = (t) => (t.length > w ? "\u2026" + t.slice(-(w - 1)) : t.padEnd(w));
+  const priceNote = table ? " (public API list prices)" : " (price list unreachable, tokens only)";
+  console.log(`\nAI coding-agent usage on this machine, last ${d} days${priceNote}\n`);
+  console.log(`${label.padEnd(w)}  ${"SESSIONS".padStart(8)}  ${"OUTPUT".padStart(8)}  ${"LIST COST".padStart(11)}${billable ? "  " + "BILLABLE".padStart(11) : ""}`);
+  for (const r of list.slice(0, 25)) {
+    const bill = billable ? "  " + usd(Math.round(r.cost * r.rate * 100) / 100).padStart(11) : "";
+    console.log(`${clip(r.key)}  ${String(r.sessions).padStart(8)}  ${tok(r.out).padStart(8)}  ${(table ? usd(r.cost) : "").padStart(11)}${bill}`);
+  }
+  if (list.length > 25) console.log(`\u2026 and ${list.length - 25} more ${by}s`);
+
+  // The client column covers only mapped repos, so its total is the sum of the rows above it, not the
+  // machine total. Every other grouping does total to the machine, which is why only this one differs.
+  const shown = list.reduce((n, r) => n + r.cost, 0);
+  const shownSessions = by === "client" ? list.reduce((n, r) => n + r.sessions, 0) : rows.length;
+  // Summed from rounded rows on purpose: a client adding up the lines you showed them has to land on
+  // the total you billed. The hosted invoice sheet rounds the same way for the same reason.
+  const billTotal = list.reduce((n, r) => n + Math.round(r.cost * r.rate * 100) / 100, 0);
+  console.log(`${"TOTAL".padEnd(w)}  ${String(shownSessions).padStart(8)}  ${tok(list.reduce((n, r) => n + r.out, 0)).padStart(8)}  ${(table ? usd(shown) : "").padStart(11)}${billable ? "  " + usd(billTotal).padStart(11) : ""}`);
+
+  if (by === "client") {
+    const unmapped = total - shown;
+    if (table && unmapped > 0.005) console.log(`\nNot counted: ${usd(unmapped)} in repos no client claims. \`tallyhook clients\` lists them.`);
+  }
   if (table) {
     const top = rows.slice().sort((a, b) => b._cost - a._cost)[0];
-    if (prevRows.length) {
+    if (prevRows.length && by !== "client") {
       const pct = prevTotal > 0.005 ? Math.round(((total - prevTotal) / prevTotal) * 100) : null;
       const dir = total >= prevTotal ? "up" : "down";
-      console.log(`\nPrevious ${d} days: ${usd(prevTotal)} across ${prevRows.length} session${prevRows.length === 1 ? "" : "s"}${pct === null ? "" : ` — ${dir} ${Math.abs(pct)}%`}.`);
+      console.log(`\nPrevious ${d} days: ${usd(prevTotal)} across ${prevRows.length} session${prevRows.length === 1 ? "" : "s"}${pct === null ? "" : ` \u2014 ${dir} ${Math.abs(pct)}%`}.`);
     }
     console.log(`\nMost expensive session: ${usd(top._cost)} in ${top.repo || "(no repo)"}, started ${top.started_at.slice(0, 10)}.`);
     if (unpriced.size) console.log(`No list price for: ${[...unpriced].join(", ")} (counted as $0).`);
     console.log("List price is what this usage would cost on the API. On a subscription it is the value you used, not a bill.");
   }
-  console.log(`\nNothing was uploaded. To see this across a team, per client, with invoices: ${apiUrl}\n`);
+  // The nudge depends on what they have not done yet: map a client, or outgrow one machine.
+  if (by !== "client" && !cfg.clients.length) {
+    console.log(`\nBilling a client for some of this? Group the repos and mark them up, locally:\n  tallyhook clients add "Acme Corp" ${(list.find((r) => r.key !== "(no repo)") || { key: "acme-web" }).key.split("/").pop()} --rate 20`);
+  }
+  console.log(`\nNothing was uploaded. For history older than your logs, several developers in one total,\nand a report link you can send a client: ${apiUrl}\n`);
+}
+
+// ---------- clients (the local billing map) ----------
+// Flag values must not be mistaken for positional arguments: `clients add "Acme" web --rate 20` has
+// three positionals, not four.
+function positional(rest, withValue) {
+  const out = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a.startsWith("-")) { if (withValue.includes(a)) i++; continue; }
+    out.push(a);
+  }
+  return out;
+}
+
+async function clientsCmd(rest, days, api) {
+  const pos = positional(rest, ["--rate", "--days", "--api"]);
+  const [sub, name, ...repos] = pos;
+  const rateArg = (() => { const i = rest.indexOf("--rate"); return i >= 0 ? rest[i + 1] : undefined; })();
+  const cfg = readClients();
+
+  if (sub === "add") {
+    if (!name || !repos.length) { console.error('usage: tallyhook clients add "Acme Corp" <repo-pattern>... [--rate 20]'); process.exit(1); }
+    const i = cfg.clients.findIndex((c) => String(c.name).toLowerCase() === name.toLowerCase());
+    const entry = { name, repos, ...(rateArg !== undefined ? { ratePct: Number(rateArg) } : {}) };
+    if (i >= 0) cfg.clients[i] = { ...cfg.clients[i], ...entry }; else cfg.clients.push(entry);
+    writeClients(cfg);
+    console.log(`tallyhook: ${i >= 0 ? "updated" : "added"} ${name} \u2014 ${repos.join(", ")}${rateArg !== undefined ? ` at +${Number(rateArg)}%` : ""}`);
+    // Immediate feedback, because a pattern that silently matches nothing is the whole failure mode
+    // of this feature. Say what it caught, in money, before they trust it with an invoice.
+    const g = await gather(days, api);
+    const mine = g.rows.filter((s) => (entry.repos || []).some((pat) => matchesPattern(s.repo || "", pat)));
+    const cost = mine.reduce((n, s) => n + s._cost, 0);
+    if (!mine.length) console.log(`Matches nothing in the last ${g.days} days. Check the pattern against \`tallyhook clients\`.`);
+    else console.log(`Matches ${mine.length} session${mine.length === 1 ? "" : "s"}${g.priced ? ` worth ${usd(cost)}` : ""} in the last ${g.days} days. See it: tallyhook --by client`);
+    return;
+  }
+
+  if (sub === "rm" || sub === "remove") {
+    if (!name) { console.error('usage: tallyhook clients rm "Acme Corp"'); process.exit(1); }
+    const before = cfg.clients.length;
+    cfg.clients = cfg.clients.filter((c) => String(c.name).toLowerCase() !== name.toLowerCase());
+    if (cfg.clients.length === before) { console.log(`tallyhook: no client named ${name}.`); return; }
+    writeClients(cfg);
+    console.log(`tallyhook: removed ${name}.`);
+    return;
+  }
+
+  if (sub === "markup") {
+    const pct = Number(name);
+    if (!Number.isFinite(pct)) { console.error("usage: tallyhook clients markup 20"); process.exit(1); }
+    cfg.markupPct = pct; writeClients(cfg);
+    console.log(`tallyhook: default markup is now +${pct}% (clients with their own --rate keep it).`);
+    return;
+  }
+
+  // Bare `tallyhook clients`: the mapping, then the repos nobody claims, most expensive first. That
+  // second list is the point -- it is the work queue for getting a complete invoice.
+  const g = await gather(days, api);
+  const repoList = rank(g, "repo", cfg);
+  if (cfg.clients.length) {
+    console.log(`\nClients in ${CLIENTS}${cfg.markupPct ? ` (default markup +${cfg.markupPct}%)` : ""}\n`);
+    const w = Math.max(10, ...cfg.clients.map((c) => String(c.name).length));
+    for (const c of cfg.clients) {
+      const rate = rateOf(c, cfg);
+      console.log(`${String(c.name).padEnd(w)}  +${Math.round((rate - 1) * 100)}%  ${(c.repos || []).join(", ")}`);
+    }
+  } else {
+    console.log(`\nNo clients defined yet. ${CLIENTS} does not exist.\n`);
+  }
+  const unmapped = repoList.filter((r) => r.key !== "(no repo)" && !clientFor(r.key, cfg.clients));
+  if (unmapped.length) {
+    console.log(`\nRepos no client claims, last ${g.days} days:\n`);
+    const w = Math.min(56, Math.max(10, ...unmapped.map((r) => r.key.length)));
+    for (const r of unmapped.slice(0, 20)) console.log(`  ${r.key.padEnd(w)}  ${(g.priced ? usd(r.cost) : "").padStart(11)}`);
+    if (unmapped.length > 20) console.log(`  \u2026 and ${unmapped.length - 20} more`);
+    console.log(`\nMap one:  tallyhook clients add "Client name" ${unmapped[0].key.split("/").pop()} --rate 20\n`);
+  } else if (cfg.clients.length) {
+    console.log(`\nEvery repo with spend is mapped. tallyhook --by client\n`);
+  }
 }
 
 // ---------- mcp ----------
@@ -640,8 +820,8 @@ const MCP_TOOLS = [
 
 async function mcpCall(name, args) {
   const days = args && args.days;
-  if (name === "usage_by_repo") return summaryOf(await gather(days), false);
-  if (name === "usage_by_model") return summaryOf(await gather(days), true);
+  if (name === "usage_by_repo") return summaryOf(await gather(days), "repo");
+  if (name === "usage_by_model") return summaryOf(await gather(days), "model");
   if (name === "usage_summary") {
     const g = await gather(days);
     const pct = g.priced && g.prevTotal > 0.005 ? Math.round(((g.total - g.prevTotal) / g.prevTotal) * 100) : null;
@@ -651,7 +831,7 @@ async function mcpCall(name, args) {
       total_cost_usd: g.priced ? Number(g.total.toFixed(4)) : null,
       previous_period: { sessions: g.prevRows.length, total_cost_usd: g.priced ? Number(g.prevTotal.toFixed(4)) : null },
       change_pct: pct,
-      repos: rank(g, false).length,
+      repos: rank(g, "repo").length,
       unpriced_models: [...g.unpriced],
       note: "List price is what this usage would cost on the API. On a subscription it is the value of what you used, not a bill.",
     };
@@ -779,17 +959,56 @@ function status() {
 }
 
 (async () => {
-  const [cmd, ...rest] = process.argv.slice(2);
+  const argv = process.argv.slice(2);
+  const first = argv[0];
+  // Bare `npx tallyhook` runs the report. This is the entire front door: someone who has just heard
+  // the name types it with no arguments, and a usage blob at that moment is a dead end -- they came to
+  // find out what they are spending. Flags with no verb mean the report too (`tallyhook --days 7`),
+  // so the common case never needs a subcommand. Named commands keep working exactly as before.
+  const COMMANDS = ["install", "sync", "report", "mcp", "status", "uninstall", "clients"];
+  let cmd, rest;
+  if (first === "help" || first === "--help" || first === "-h") { cmd = "help"; rest = []; }
+  else if (first === "--version" || first === "-v") { cmd = "version"; rest = []; }
+  else if (!first || first.startsWith("-")) { cmd = "report"; rest = argv; }
+  else if (COMMANDS.includes(first)) { cmd = first; rest = argv.slice(1); }
+  else { cmd = "unknown"; rest = argv; }
+
   const flag = (n) => rest.includes(n);
   const val = (n) => { const i = rest.indexOf(n); return i >= 0 ? rest[i + 1] : undefined; };
+  const HELP = `tallyhook v${VERSION} \u2014 what your AI coding agents cost, per repo and per client.
+
+  tallyhook                                  spend per repo, last 30 days
+  tallyhook --by client                      roll those repos up into the clients you bill
+  tallyhook --by model                       the same spend per model
+  tallyhook --days 7                         any window      (--json for a machine, --markup 20 to try a rate)
+
+  tallyhook clients                          the billing map, and which repos nobody claims yet
+  tallyhook clients add "Acme Corp" acme-web acme-api --rate 20
+  tallyhook clients rm "Acme Corp"
+  tallyhook clients markup 20                default rate for clients without their own
+
+  tallyhook mcp                              MCP server over stdio, so an agent can ask what it cost
+  tallyhook install <token> [--api URL]      also send sessions to a Tallyhook workspace
+  tallyhook status                           what is installed
+  tallyhook uninstall                        remove the hooks and ~/.tallyhook
+
+Everything above \`install\` is local: it reads logs already on your disk and uploads nothing.`;
+
   try {
-    if (cmd === "install") await install(rest.find((a) => !a.startsWith("--")), val("--api"));
+    if (cmd === "help") console.log(HELP);
+    else if (cmd === "version") console.log(VERSION);
+    else if (cmd === "unknown") { console.error(`tallyhook: no such command \u2018${first}\u2019\n\n` + HELP); process.exit(1); }
+    else if (cmd === "install") await install(rest.find((a) => !a.startsWith("--")), val("--api"));
     else if (cmd === "sync") await sync({ quiet: flag("--quiet"), full: flag("--full"), dryRun: flag("--dry-run"), stopHook: flag("--stop-hook"), hook: flag("--hook") || flag("--stop-hook") });
-    else if (cmd === "report") await report(val("--days"), val("--api"), { json: flag("--json"), groupBy: val("--by") === "model" ? "model" : "repo" });
+    else if (cmd === "report") await report(val("--days"), val("--api"), {
+      json: flag("--json"),
+      groupBy: val("--by") === "model" ? "model" : val("--by") === "client" ? "client" : "repo",
+      markupPct: flag("--markup") ? Number(val("--markup")) : undefined,
+    });
+    else if (cmd === "clients") await clientsCmd(rest, val("--days"), val("--api"));
     else if (cmd === "mcp") mcp();
     else if (cmd === "status") status();
     else if (cmd === "uninstall") uninstall();
-    else console.log("tallyhook collector v" + VERSION + "\n  install <token> [--api URL]\n  sync [--quiet] [--full] [--dry-run]\n  status\n  uninstall\n  report [--days 30] [--by model] [--json]   (local only, nothing uploaded)\n  mcp                                       (MCP server over stdio, local only, no account)");
   } catch (e) {
     console.error("tallyhook: " + (e && e.message ? e.message : e));
     // A sync running from a Claude Code hook must never block a turn, even for an error this

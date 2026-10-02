@@ -1,0 +1,13 @@
+{
+  "name": "tallyhook",
+  "description": "Cost and billing for AI coding agents: what each repo cost, and what to invoice each client you bill.",
+  "owner": { "name": "Tallyhook", "url": "https://tallyhook.dev" },
+  "plugins": [
+    {
+      "name": "tallyhook",
+      "source": "./plugin",
+      "category": "usage-analytics",
+      "tags": ["cost", "usage", "tokens", "billing", "invoice", "claude-code", "codex", "agency"]
+    }
+  ]
+}
