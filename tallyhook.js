@@ -18,7 +18,7 @@ const path = require("path");
 const zlib = require("zlib");
 const { execFileSync } = require("child_process");
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const FETCH_TIMEOUT_MS = 8000;
 const HOME = os.homedir();
 const DIR = path.join(HOME, ".tallyhook");
@@ -451,6 +451,7 @@ async function sync(opts) {
   log(opts.quiet, `tallyhook: uploaded ${uploaded} session(s) as ${dev.key}`);
 }
 
+const r2 = (n) => Math.round(n * 100) / 100;
 const usd = (n) => "$" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 const tok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
 
@@ -462,8 +463,21 @@ const tok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3)
 // disk, several developers in one total, and a link you can hand a client.
 const CLIENTS = path.join(DIR, "clients.json");
 function readClients() {
-  const c = readJson(CLIENTS, null) || {};
-  return { markupPct: Number(c.markupPct) || 0, clients: Array.isArray(c.clients) ? c.clients : [] };
+  if (!fs.existsSync(CLIENTS)) return { markupPct: 0, clients: [] };
+  const text = fs.readFileSync(CLIENTS, "utf8");
+  if (!text.trim()) return { markupPct: 0, clients: [] };
+  let c;
+  try { c = JSON.parse(text); } catch { throw new Error(`${CLIENTS} is not valid JSON; fix it before running this again so the mapping in it is not lost`); }
+  // Drop entries that cannot be used rather than crashing halfway through a report on them, and say
+  // which ones went, because a silently ignored client is a silently missing invoice line.
+  const raw = c && Array.isArray(c.clients) ? c.clients : [];
+  const clients = [];
+  for (const [i, e] of raw.entries()) {
+    if (!e || typeof e !== "object" || typeof e.name !== "string" || !e.name.trim()) { console.error(`tallyhook: ignoring client #${i + 1} in ${CLIENTS}: it has no name`); continue; }
+    if (!Array.isArray(e.repos)) { console.error(`tallyhook: ignoring client ${JSON.stringify(e.name)}: "repos" must be a list of patterns`); continue; }
+    clients.push(e);
+  }
+  return { markupPct: Number(c && c.markupPct) || 0, clients };
 }
 function writeClients(c) { fs.mkdirSync(DIR, { recursive: true }); writeJson(CLIENTS, c); }
 
@@ -489,6 +503,13 @@ function clientFor(repo, clients) {
 // A per-client rate overrides the file-wide default; absent both, billable equals cost. A `--markup`
 // typed on the command line beats both, because it is the most specific statement of intent available
 // -- without that, `--markup 50` silently does nothing on a file where every client has its own rate.
+// Throws rather than returning a default, so a bad number can never quietly become a real figure.
+function pct(v, flag) {
+  const n = Number(v);
+  if (v === undefined || v === null || String(v).trim() === "" || !Number.isFinite(n)) throw new Error(`${flag} needs a number, for example ${flag} 20`);
+  if (n < -100 || n > 10000) throw new Error(`${flag} ${v} is out of range (-100 to 10000)`);
+  return n;
+}
 function rateOf(c, cfg) {
   const fallback = cfg && typeof cfg === "object" ? cfg.markupPct : cfg;
   const forced = cfg && typeof cfg === "object" && cfg.forceMarkup;
@@ -557,6 +578,7 @@ function loadPrices(api) {
 }
 
 async function gather(days, api) {
+  if (days !== undefined && !/^\d+$/.test(String(days).trim())) throw new Error(`--days ${days} is not a whole number of days`);
   days = Math.max(1, Math.min(3650, parseInt(days, 10) || 30));
   api = (api || (readJson(CONFIG, null) || {}).api || "https://tallyhook.dev").replace(/\/$/, "");
   const all = await loadSessions();
@@ -621,6 +643,15 @@ function summaryOf(g, by, cfg) {
     total_cost_usd: g.priced ? Number(g.total.toFixed(4)) : null,
     previous_period: { sessions: g.prevRows.length, total_cost_usd: g.priced ? Number(g.prevTotal.toFixed(4)) : null },
     unpriced_models: [...g.unpriced],
+    // Only a client report can fail to cover the machine, because it counts mapped repos only. These
+    // two fields make that reconcilable: counted + not_counted === total, always.
+    ...(by === "client" ? {
+      counted: {
+        sessions: list.reduce((n, r) => n + r.sessions, 0),
+        cost_usd: g.priced ? r2(list.reduce((n, r) => n + r.cost, 0)) : null,
+      },
+      not_counted_cost_usd: g.priced ? r2(g.total - list.reduce((n, r) => n + r.cost, 0)) : null,
+    } : {}),
     [key + "s"]: list.map((r) => ({
       [key]: r.key,
       sessions: r.sessions,
@@ -629,7 +660,7 @@ function summaryOf(g, by, cfg) {
       // Rounded to the cent, because this is the number that goes on an invoice. Summing rounded
       // rows is deliberate and matches the hosted invoice sheet: a client adding up the lines you
       // showed them must land on the total you billed.
-      ...(r.rate !== 1 ? { rate_multiplier: Number(r.rate.toFixed(4)), billable_usd: g.priced ? Number((r.cost * r.rate).toFixed(2)) : null } : {}),
+      ...(r.rate !== 1 ? { rate_multiplier: Number(r.rate.toFixed(4)), billable_usd: g.priced ? r2(r.cost * r.rate) : null } : {}),
     })),
   };
 }
@@ -670,18 +701,18 @@ async function report(days, api, { json = false, groupBy = "repo", markupPct } =
   console.log(`\nAI coding-agent usage on this machine, last ${d} days${priceNote}\n`);
   console.log(`${label.padEnd(w)}  ${"SESSIONS".padStart(8)}  ${"OUTPUT".padStart(8)}  ${"LIST COST".padStart(11)}${billable ? "  " + "BILLABLE".padStart(11) : ""}`);
   for (const r of list.slice(0, 25)) {
-    const bill = billable ? "  " + usd(Math.round(r.cost * r.rate * 100) / 100).padStart(11) : "";
+    const bill = billable ? "  " + usd(r2(r.cost * r.rate)).padStart(11) : "";
     console.log(`${clip(r.key)}  ${String(r.sessions).padStart(8)}  ${tok(r.out).padStart(8)}  ${(table ? usd(r.cost) : "").padStart(11)}${bill}`);
   }
   if (list.length > 25) console.log(`\u2026 and ${list.length - 25} more ${by}s`);
 
   // The client column covers only mapped repos, so its total is the sum of the rows above it, not the
   // machine total. Every other grouping does total to the machine, which is why only this one differs.
-  const shown = list.reduce((n, r) => n + r.cost, 0);
+  const shown = list.reduce((n, r) => n + r2(r.cost), 0);
   const shownSessions = by === "client" ? list.reduce((n, r) => n + r.sessions, 0) : rows.length;
   // Summed from rounded rows on purpose: a client adding up the lines you showed them has to land on
   // the total you billed. The hosted invoice sheet rounds the same way for the same reason.
-  const billTotal = list.reduce((n, r) => n + Math.round(r.cost * r.rate * 100) / 100, 0);
+  const billTotal = list.reduce((n, r) => n + r2(r.cost * r.rate), 0);
   console.log(`${"TOTAL".padEnd(w)}  ${String(shownSessions).padStart(8)}  ${tok(list.reduce((n, r) => n + r.out, 0)).padStart(8)}  ${(table ? usd(shown) : "").padStart(11)}${billable ? "  " + usd(billTotal).padStart(11) : ""}`);
 
   if (by === "client") {
@@ -728,16 +759,23 @@ async function clientsCmd(rest, days, api) {
   if (sub === "add") {
     if (!name || !repos.length) { console.error('usage: tallyhook clients add "Acme Corp" <repo-pattern>... [--rate 20]'); process.exit(1); }
     const i = cfg.clients.findIndex((c) => String(c.name).toLowerCase() === name.toLowerCase());
-    const entry = { name, repos, ...(rateArg !== undefined ? { ratePct: Number(rateArg) } : {}) };
-    if (i >= 0) cfg.clients[i] = { ...cfg.clients[i], ...entry }; else cfg.clients.push(entry);
+    const entry = { name, repos, ...(rateArg !== undefined ? { ratePct: pct(rateArg, "--rate") } : {}) };
+    // Keep a reference to the object that actually ends up in the list: on the update path the spread
+    // makes a new object, and the match check below compares by identity.
+    const stored = i >= 0 ? (cfg.clients[i] = { ...cfg.clients[i], ...entry }) : (cfg.clients.push(entry), entry);
     writeClients(cfg);
-    console.log(`tallyhook: ${i >= 0 ? "updated" : "added"} ${name} \u2014 ${repos.join(", ")}${rateArg !== undefined ? ` at +${Number(rateArg)}%` : ""}`);
+    console.log(`tallyhook: ${i >= 0 ? "updated" : "added"} ${name} \u2014 ${repos.join(", ")}${rateArg !== undefined ? ` at +${pct(rateArg, "--rate")}%` : ""}`);
     // Immediate feedback, because a pattern that silently matches nothing is the whole failure mode
     // of this feature. Say what it caught, in money, before they trust it with an invoice.
     const g = await gather(days, api);
-    const mine = g.rows.filter((s) => (entry.repos || []).some((pat) => matchesPattern(s.repo || "", pat)));
+    const mine = g.rows.filter((s) => clientFor(s.repo || "", cfg.clients) === stored);
     const cost = mine.reduce((n, s) => n + s._cost, 0);
-    if (!mine.length) console.log(`Matches nothing in the last ${g.days} days. Check the pattern against \`tallyhook clients\`.`);
+    if (!mine.length) {
+      const anyMatch = g.rows.some((s) => (stored.repos || []).some((pat) => matchesPattern(s.repo || "", pat)));
+      console.log(anyMatch
+        ? `Matches nothing new: every repo those patterns catch is already claimed by a client listed earlier. First match wins \u2014 see \`tallyhook clients\`.`
+        : `Matches nothing in the last ${g.days} days. Check the pattern against \`tallyhook clients\`.`);
+    }
     else console.log(`Matches ${mine.length} session${mine.length === 1 ? "" : "s"}${g.priced ? ` worth ${usd(cost)}` : ""} in the last ${g.days} days. See it: tallyhook --by client`);
     return;
   }
@@ -753,10 +791,12 @@ async function clientsCmd(rest, days, api) {
   }
 
   if (sub === "markup") {
-    const pct = Number(name);
-    if (!Number.isFinite(pct)) { console.error("usage: tallyhook clients markup 20"); process.exit(1); }
-    cfg.markupPct = pct; writeClients(cfg);
-    console.log(`tallyhook: default markup is now +${pct}% (clients with their own --rate keep it).`);
+    // Read from rest, not from positional(): a negative markup is a legitimate discount and
+    // positional() drops anything starting with "-".
+    const raw = rest[rest.indexOf("markup") + 1];
+    cfg.markupPct = pct(raw, "clients markup");
+    writeClients(cfg);
+    console.log(`tallyhook: default markup is now ${cfg.markupPct >= 0 ? "+" : ""}${cfg.markupPct}% (clients with their own --rate keep it).`);
     return;
   }
 
@@ -769,7 +809,8 @@ async function clientsCmd(rest, days, api) {
     const w = Math.max(10, ...cfg.clients.map((c) => String(c.name).length));
     for (const c of cfg.clients) {
       const rate = rateOf(c, cfg);
-      console.log(`${String(c.name).padEnd(w)}  +${Math.round((rate - 1) * 100)}%  ${(c.repos || []).join(", ")}`);
+      const pctStr = `${rate >= 1 ? "+" : ""}${Math.round((rate - 1) * 100)}%`;
+      console.log(`${String(c.name).padEnd(w)}  ${pctStr.padStart(6)}  ${(c.repos || []).join(", ")}`);
     }
   } else {
     console.log(`\nNo clients defined yet. ${CLIENTS} does not exist.\n`);
@@ -975,6 +1016,14 @@ function status() {
 
   const flag = (n) => rest.includes(n);
   const val = (n) => { const i = rest.indexOf(n); return i >= 0 ? rest[i + 1] : undefined; };
+  // Accepts the singular and the plural, and refuses anything else rather than quietly returning a
+  // different grouping than the one that was asked for.
+  const groupArg = (v) => {
+    if (v === undefined) return "repo";
+    const k = String(v).toLowerCase().replace(/s$/, "");
+    if (k === "repo" || k === "model" || k === "client") return k;
+    throw new Error(`--by ${v} is not a grouping; use --by repo, --by model or --by client`);
+  };
   const HELP = `tallyhook v${VERSION} \u2014 what your AI coding agents cost, per repo and per client.
 
   tallyhook                                  spend per repo, last 30 days
@@ -1002,8 +1051,8 @@ Everything above \`install\` is local: it reads logs already on your disk and up
     else if (cmd === "sync") await sync({ quiet: flag("--quiet"), full: flag("--full"), dryRun: flag("--dry-run"), stopHook: flag("--stop-hook"), hook: flag("--hook") || flag("--stop-hook") });
     else if (cmd === "report") await report(val("--days"), val("--api"), {
       json: flag("--json"),
-      groupBy: val("--by") === "model" ? "model" : val("--by") === "client" ? "client" : "repo",
-      markupPct: flag("--markup") ? Number(val("--markup")) : undefined,
+      groupBy: groupArg(val("--by")),
+      markupPct: flag("--markup") ? pct(val("--markup"), "--markup") : undefined,
     });
     else if (cmd === "clients") await clientsCmd(rest, val("--days"), val("--api"));
     else if (cmd === "mcp") mcp();

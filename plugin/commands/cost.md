@@ -10,7 +10,7 @@ Run the local reporter. It reads the Claude Code and Codex logs already on this 
 account, and uploads nothing:
 
 ```sh
-npx -y tallyhook@0.5.0 --json $ARGUMENTS
+npx -y tallyhook@0.5.1 --json $ARGUMENTS
 ```
 
 Interpret `$ARGUMENTS` loosely before you run it, and translate it into the real flags:

@@ -1,7 +1,7 @@
 {
   "name": "tallyhook",
   "displayName": "Tallyhook",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "What your AI coding agents cost: per repo, per model, and per client you bill. Reads the logs already on your disk. No account, nothing uploaded.",
   "author": {
     "name": "Tallyhook",
@@ -22,7 +22,7 @@
       "command": "npx",
       "args": [
         "-y",
-        "tallyhook@0.5.0",
+        "tallyhook@0.5.1",
         "mcp"
       ]
     }

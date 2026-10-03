@@ -64,7 +64,7 @@ npx tallyhook mcp                   # MCP server, so an agent can ask what its o
 | `--days 90` | a longer window. The trend line always compares against the equally long window immediately before it, so `--days 7` compares this week against last week. |
 | `--by client\|model\|repo` | how to group. A session that spanned two models has its cost split between them rather than attributed whole. |
 | `--markup 20` | try a rate without saving it. Beats any stored rate for that one run, so it never silently no-ops. |
-| `--json` | the same numbers with no prose, for a script. Nothing unpriceable is guessed: if the price table is unreachable every cost is `null` and `priced` is `false`. |
+| `--json` | the same numbers with no prose, for a script. Nothing unpriceable is guessed: if the price table is unreachable every cost is `null` and `priced` is `false`. With `--by client` it also carries `counted` and `not_counted_cost_usd`, which always add up to `total_cost_usd`, so a script can tell how much of the machine the client rows actually cover. |
 
 Everything above runs entirely on your machine. The only network call is a `GET` for the public price
 table (`https://tallyhook.dev/api/prices`). Prefer to read it before you run it? It is one file,

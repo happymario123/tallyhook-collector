@@ -1,6 +1,6 @@
 {
   "name": "tallyhook",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "What your AI coding agents cost, per repo and per client you bill. Reads the session logs Claude Code and Codex CLI already write on your machine, prices them, and rolls repos up into clients with your markup. Includes an MCP server. No account, zero dependencies.",
   "keywords": [
     "claude-code",
