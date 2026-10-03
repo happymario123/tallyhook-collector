@@ -27,12 +27,12 @@
   ],
   "homepage": "https://tallyhook.dev",
   "bugs": {
-    "url": "https://github.com/happymario123/tallyhook-collector/issues",
+    "url": "https://github.com/tallyhook/tallyhook-collector/issues",
     "email": "support@tallyhook.dev"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/happymario123/tallyhook-collector.git"
+    "url": "git+https://github.com/tallyhook/tallyhook-collector.git"
   },
   "license": "MIT",
   "author": "Tallyhook",
