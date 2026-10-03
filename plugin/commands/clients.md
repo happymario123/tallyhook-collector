@@ -9,13 +9,13 @@ Help the user map repositories to the clients they bill, so agent spend can be i
 First show the current state, which also lists every repo no client claims yet:
 
 ```sh
-npx -y tallyhook clients
+npx -y tallyhook@0.5.0 clients
 ```
 
 If `$ARGUMENTS` names a client and one or more repo patterns, add it:
 
 ```sh
-npx -y tallyhook clients add "<client name>" <pattern>... --rate <percent>
+npx -y tallyhook@0.5.0 clients add "<client name>" <pattern>... --rate <percent>
 ```
 
 Notes that matter:
@@ -33,4 +33,4 @@ After adding, the command reports how many sessions and how much spend the new p
 matched. If it matched nothing, the pattern is wrong — show the unmapped repo list again and suggest
 one that appears in it rather than guessing twice.
 
-Then offer `npx -y tallyhook --by client` to show the billable table.
+Then offer `npx -y tallyhook@0.5.0 --by client` to show the billable table.

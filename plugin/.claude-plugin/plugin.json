@@ -22,7 +22,7 @@
       "command": "npx",
       "args": [
         "-y",
-        "tallyhook",
+        "tallyhook@0.5.0",
         "mcp"
       ]
     }
