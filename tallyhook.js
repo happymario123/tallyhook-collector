@@ -734,7 +734,15 @@ async function report(days, api, { json = false, groupBy = "repo", markupPct } =
   if (by !== "client" && !cfg.clients.length) {
     console.log(`\nBilling a client for some of this? Group the repos and mark them up, locally:\n  tallyhook clients add "Acme Corp" ${(list.find((r) => r.key !== "(no repo)") || { key: "acme-web" }).key.split("/").pop()} --rate 20`);
   }
-  console.log(`\nNothing was uploaded. For history older than your logs, several developers in one total,\nand a report link you can send a client: ${apiUrl}\n`);
+  // Someone looking at a billable figure for a named client is at the one moment where the hosted
+  // document is obviously the next step, so name that instead of listing features -- and lead with
+  // log rotation, which is the reason that applies to one person working alone. Claude Code does
+  // delete old session files, so these months genuinely are the only copy.
+  if (by === "client" && billable && list.length) {
+    console.log(`\nNothing was uploaded, and Claude Code eventually deletes these logs \u2014 so this is the only\ncopy of these months. For history that outlives them, and a page you can send ${list[0].key}\ninstead of a screenshot: ${apiUrl}\n`);
+  } else {
+    console.log(`\nNothing was uploaded. For history older than your logs, several developers in one total,\nand a report link you can send a client: ${apiUrl}\n`);
+  }
 }
 
 // ---------- clients (the local billing map) ----------
